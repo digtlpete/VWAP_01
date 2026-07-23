@@ -13,6 +13,9 @@
 // Canonical libs:
 //   g:\OneDrive\01_TRADING\AFL_DEV\SharedAFL\lib\
 //
+// Live IB: Param "Enable Auto Trading" + chart Indicator. Uses
+//   AFL_Lib_IBEngine.afl (MKT on Buy/Short, VWAP trail, EOD flatten).
+//   Inert in Backtest / Explore / Scan.
 // Regression:
 //   1. python tools/make_regression_apx.py VWAP_01_STRATEGY.afl automation/Backtest_Regression.apx
 //   2. python tools/make_cleanup_apx.py VWTT
@@ -88,10 +91,45 @@ EnableUniverseRank  = ParamToggle("Universe Rank Gate (backtest)", "No|Yes", 0);
 UniverseTopN        = Param("Universe Top-N (rank cut)", 15, 1, 200, 1);
 _SECTION_END();
 
-_SECTION_BEGIN("Display");
-ShowRthVwapBands    = ParamToggle("Show RTH VWAP + SD Bands", "No|Yes", 1);
-ShowRthVwap2SD      = ParamToggle("Show ±2 SD Bands", "No|Yes", 1);
-ShowStopLine        = ParamToggle("Show Active Stop Line", "No|Yes", 1);
+_SECTION_BEGIN("Chart Display");
+ShowRthVwapBands     = ParamToggle("Show RTH VWAP + SD Bands", "No|Yes", 1);
+ShowRthVwap2SD       = ParamToggle("Show ±2 SD Bands", "No|Yes", 1);
+VwapColor            = ParamColor("VWAP Color", ColorRGB(138, 102, 232));
+VwapStyle            = ParamStyle("VWAP Style", styleLine, maskAll);
+VwapWidth            = Param("VWAP Width", 2, 1, 5, 1);
+SD1Color             = ParamColor("±1 SD Color", ColorRGB(138, 102, 232));
+SD1Style             = ParamStyle("±1 SD Style", styleDashed, maskAll);
+SD1Width             = Param("±1 SD Width", 1, 1, 5, 1);
+SD2Color             = ParamColor("±2 SD Color", colorBrightGreen);
+SD2Style             = ParamStyle("±2 SD Style", styleDashed, maskAll);
+SD2Width             = Param("±2 SD Width", 1, 1, 5, 1);
+ShowEntryLine        = ParamToggle("Show Entry Line", "No|Yes", 1);
+EntryLineColor       = ParamColor("Entry Line Color", ColorRGB(180, 180, 180));
+EntryLineWidth       = Param("Entry Line Width", 2, 1, 5, 1);
+ShowStopLine         = ParamToggle("Show Stop / Trail Line", "No|Yes", 1);
+StopLineColor        = ParamColor("Stop Line Color", colorRed);
+StopLineWidth        = Param("Stop Line Width", 2, 1, 5, 1);
+_SECTION_END();
+
+_SECTION_BEGIN("IB Auto Trading");
+// Live execution via SharedAFL IBEngine. Inert unless Enable Auto Trading
+// is Yes AND the formula runs as a chart Indicator (not Backtest/Explore).
+EnableAutoTrade     = ParamToggle("Enable Auto Trading", "No|Yes", 0);
+AutoTradeTransmit   = ParamToggle("Auto Transmit Orders", "No|Yes", 0);
+IBTickSize          = Param("IB Tick Size (pips)", 100, 1, 10000, 1);
+EnableLong          = ParamToggle("Enable Long Trades", "No|Yes", 1);
+EnableShort         = ParamToggle("Enable Short Trades", "No|Yes", 1);
+// VWAP can re-enter many times per day (trail stops). Cap live fills/side.
+MaxBreakNumber      = Param("Max Entries Per Side / Day", 50, 1, 200, 1);
+EnableMaxPortfolioPositions = ParamToggle("Enable Max Portfolio Positions", "No|Yes", 1);
+MaxPortfolioPositions       = Param("Max Portfolio Positions", 5, 1, 50, 1);
+TriggerPanic        = ParamTrigger("PANIC: Close All", "CLOSE ALL & CANCEL");
+TriggerCancelEntry  = ParamTrigger("Cancel Entry Orders", "CANCEL ENTRIES");
+TriggerResetTrack   = ParamTrigger("RESET Tracking", "RESET STRATEGY STATE");
+RecoveryFlagFile    = ParamStr("Recovery Flag File",
+    "g:/OneDrive/01_TRADING/AFL_DEV/VWAP_01/automation/state/RECOVERY_MODE.flag");
+DebugTrace          = ParamToggle("Debug Trace to Log", "No|Yes", 1);
+DebugVerbose        = ParamToggle("Debug Verbose (per-refresh)", "No|Yes", 0);
 _SECTION_END();
 
 // ============================================================================
@@ -102,6 +140,38 @@ _SECTION_END();
 #include "g:\OneDrive\01_TRADING\AFL_DEV\SharedAFL\lib\AFL_Lib_DailyContext.afl"
 
 DailyATR = ATR(AtrPeriod);
+
+// ============================================================================
+// IB ENGINE ADAPTERS — satisfy AFL_Lib_IBEngine signal contract
+// ----------------------------------------------------------------------------
+// VWAP Trend Trading enters with MKT on Buy/Short (no OR breakout levels).
+// Stub ORB-only gates so the shared engine arms on the AFL signal arrays.
+// ============================================================================
+EntryMethodParam = 0;          // MKT — fire on Buy[lb] / Short[lb]
+MktConfirmClose  = 0;          // do NOT use OR close-confirm (ORB-only)
+StpLmtAtrFactor  = 0.05;       // unused in MKT mode (contract requires name)
+AtrTargetMult    = 2.5;        // unused for VWAP trail exits
+MaxStopLossPts   = 0;
+
+// Disable ORB-only filters (engine still reads these names).
+EnableChoppyFilter       = 0;
+ChoppyBlocked            = False;
+EnablePrevDayVA          = 0;
+PrevDayVA_LongOK         = True;
+PrevDayVA_ShortOK        = True;
+EnableMaxOrWidthFilter   = 0;
+MaxORWidthOverAtr        = 0;
+ORWidthOverAtr           = 0;
+EnableBreakoutVolFilter  = 0;
+BreakoutVolMult          = 0;
+AvgORBarVol              = 0;
+
+// Fake OR levels so ibORCalcOK passes; MKT arming ignores InsideOR gates.
+ORHigh       = C;
+ORLow        = C;
+ORCalculated = IsRTH;
+
+VwapPhase = 0;
 
 // ============================================================================
 // BACKTEST OPTIONS — paper defaults (APX InitialEquity can override)
@@ -148,6 +218,7 @@ shortEntrySig = IIf(UseRthVwapExit, wantShort AND NOT Ref(wantShort, -1), wantSh
 Buy = Sell = Short = Cover = 0;
 BuyPrice = SellPrice = ShortPrice = CoverPrice = Open;
 ActiveStopArr = Null;
+PosDir = PosEntry = PosStop = PosTarget = PosQty = 0;
 
 in_trade = 0;
 trade_dir = 0;
@@ -158,10 +229,20 @@ consec_1sd = 0;
 consec_2sd = 0;
 consec_reversal = 0;
 entered_favorable = 0;
+entry_price_val = 0;
+tradeQty = 0;
+dayBreakCountLong = 0;
+dayBreakCountShort = 0;
 
 for (i = 0; i < BarCount; i++)
 {
     exit_reason = "";
+
+    if (NewDay[i])
+    {
+        dayBreakCountLong = 0;
+        dayBreakCountShort = 0;
+    }
 
     // --- manage open trade ---
     if (in_trade)
@@ -407,6 +488,8 @@ for (i = 0; i < BarCount; i++)
             consec_2sd = 0;
             consec_reversal = 0;
             entered_favorable = 0;
+            entry_price_val = 0;
+            tradeQty = 0;
         }
         else
         {
@@ -437,6 +520,9 @@ for (i = 0; i < BarCount; i++)
             entered_favorable = (!IsNull(RthVwap[i]) AND RthVwap[i] > 0 AND entryP > RthVwap[i]);
             in_trade = 1;
             trade_dir = 1;
+            entry_price_val = entryP;
+            tradeQty = Max(1, floor(FixedPositionValue / entryP));
+            dayBreakCountLong = dayBreakCountLong + 1;
             ActiveStopArr[i] = trail_stop;
         }
         else if (shortEntrySig[i])
@@ -456,42 +542,63 @@ for (i = 0; i < BarCount; i++)
             entered_favorable = (!IsNull(RthVwap[i]) AND RthVwap[i] > 0 AND entryP < RthVwap[i]);
             in_trade = 1;
             trade_dir = -1;
+            entry_price_val = entryP;
+            tradeQty = Max(1, floor(FixedPositionValue / entryP));
+            dayBreakCountShort = dayBreakCountShort + 1;
             ActiveStopArr[i] = trail_stop;
         }
+    }
+
+    if (in_trade)
+    {
+        PosDir[i]    = trade_dir;
+        PosEntry[i]  = entry_price_val;
+        PosStop[i]   = IIf(trail_stop > 0, trail_stop, stop_price);
+        PosTarget[i] = 0;
+        PosQty[i]    = tradeQty;
     }
 }
 
 // Same dollar notional every trade (shares = FixedPositionValue / entry price).
 SetPositionSize(FixedPositionValue, spsValue);
 
+// IB engine uses FixedShares when UsePercentRisk is off — mirror $ notional.
+_ibPx = LastValue(C);
+if (NOT UsePercentRisk AND _ibPx > 0)
+    FixedShares = Max(1, Min(MaxShares, floor(FixedPositionValue / _ibPx)));
+
+// Session StaticVars so IBEngine scroll/day guards work without a real OR.
+_ibSvSess = "IB_" + Name() + "_Session_";
+_lastDN   = dn[BarCount - 1];
+StaticVarSet(_ibSvSess + "ORHigh", LastValue(C));
+StaticVarSet(_ibSvSess + "ORLow",  LastValue(C));
+StaticVarSet(_ibSvSess + "ORCalc", 1);
+StaticVarSet(_ibSvSess + "DN",     _lastDN);
+
+ibBktLongBreaks  = dayBreakCountLong;
+ibBktShortBreaks = dayBreakCountShort;
+VwapPhase        = vwap_phase;
+
 // ============================================================================
-// DISPLAY
+// POST-LOOP: Realized P/L via StaticVars
+// ============================================================================
+#include "g:\OneDrive\01_TRADING\AFL_DEV\SharedAFL\lib\AFL_Lib_RealizedPL.afl"
+
+// ============================================================================
+// DISPLAY — candles + SharedAFL chart overlays (ORB-identical VWAP bands,
+// IB-aware stop GFX line, position box, IbLogEvt)
 // ============================================================================
 Plot(C, "Close", colorDefault, styleCandle);
 
-if (ShowRthVwapBands)
-{
-    Plot(RthVwap, "RTH VWAP", colorYellow, styleLine | styleNoRescale);
-    Plot(RthVwapU1SD, "RTH +1 SD", colorAqua, styleLine | styleNoRescale | styleDashed);
-    Plot(RthVwapL1SD, "RTH -1 SD", colorAqua, styleLine | styleNoRescale | styleDashed);
-    if (ShowRthVwap2SD)
-    {
-        Plot(RthVwapU2SD, "RTH +2 SD", colorBlue, styleLine | styleNoRescale | styleDots);
-        Plot(RthVwapL2SD, "RTH -2 SD", colorBlue, styleLine | styleNoRescale | styleDots);
-    }
-}
-else
-{
-    Plot(RthVwap, "RTH VWAP", colorYellow, styleLine | styleNoRescale);
-}
+#include "g:\OneDrive\01_TRADING\AFL_DEV\SharedAFL\lib\AFL_Lib_ChartOverlays.afl"
 
-if (ShowStopLine)
-    Plot(ActiveStopArr, "Active Stop", colorOrange, styleLine | styleNoRescale | styleThick);
-
-PlotShapes(IIf(Buy,   shapeUpArrow,   shapeNone), colorGreen, 0, L, -12);
-PlotShapes(IIf(Short, shapeDownArrow, shapeNone), colorRed,   0, H, -12);
-PlotShapes(IIf(Sell,  shapeSmallCircle, shapeNone), colorOrange, 0, H, 12);
-PlotShapes(IIf(Cover, shapeSmallCircle, shapeNone), colorOrange, 0, L, -12);
+// ============================================================================
+// IB AUTO TRADING EXECUTION (SharedAFL/lib/AFL_Lib_IBEngine.afl)
+// MKT entries on Buy/Short, protective STP, RTH VWAP trail ModifyOrder,
+// EOD flatten, orphan recovery, portfolio cap. Inert outside indicator.
+// ============================================================================
+#include "g:\OneDrive\01_TRADING\AFL_DEV\SharedAFL\lib\AFL_Lib_IBEngine.afl"
 
 _N(Title = StrFormat("{{NAME}} " + StrategyCode + " VWAP Trend {{INTERVAL}} {{DATE}} C=%g VWAP=%g | Exit=%s",
-    C, Nz(RthVwap), WriteIf(UseRthVwapExit, "VWAP Trail", "Paper Flip")));
+    C, Nz(RthVwap), WriteIf(UseRthVwapExit, "VWAP Trail", "Paper Flip"))
+    + ibInfo);
