@@ -1,0 +1,15 @@
+# OS / editor
+Thumbs.db
+Desktop.ini
+*.tmp
+~$*
+
+# Automation runtime artifacts
+automation/state/
+automation/logs/
+
+# Regression scratch output (commit golden baselines intentionally)
+results/*.csv
+!results/.gitkeep
+
+tools/__pycache__/

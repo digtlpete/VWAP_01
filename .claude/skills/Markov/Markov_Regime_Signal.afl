@@ -1,0 +1,207 @@
+// ============================================================================
+// Markov_Regime_Signal.afl
+// Markov 2.0 — AmiBroker Signal / Backtest (FILTER or STANDALONE mode)
+// ============================================================================
+// FIX 3 — TWO EXPLICIT MODES:
+//
+//   FILTER mode (default, index 0):
+//     Markov gates your existing strategy — longs only when Signal is above
+//     threshold, shorts only when below, flat in chop. Your strategy's
+//     entry/exit logic stays yours; Markov 2.0 decides WHEN it is allowed
+//     to act. Replace the placeholder Buy/Sell blocks below with your own.
+//
+//   STANDALONE mode (index 1):
+//     Trade the regime-differential signal directly. Position size scales
+//     to |Signal| capped at MaxPosSizePct. No other strategy code needed.
+//
+// HOW TO EMBED IN FILTER MODE:
+//   1. Load this file in Analysis or paste into your strategy after your
+//      entry/exit logic.
+//   2. Find the "INSERT YOUR STRATEGY SIGNALS HERE" block.
+//   3. Replace MyBuy / MySell / MyShort / MyCover with your own arrays.
+//   4. The Markov gate (BullGate / BearGate) then filters them automatically.
+//
+// THREE FIXES:
+//   FIX 1 — Stride sampling: only stride-sampled matrix drives signals.
+//   FIX 2 — Label verification printed to Output window at analysis start.
+//   FIX 3 — Mode is explicit (FILTER vs STANDALONE) — never ambiguous.
+//
+// IMPORTANT — LOOKAHEAD NOTE:
+//   The transition matrix is built from the full analysis range, then the
+//   signal is applied per bar. This is NOT a true walk-forward and will
+//   flatter performance vs. live trading. For genuine walk-forward, use
+//   Markov_Regime_WalkForward.afl (splits history into train/test segments).
+//   Treat backtest results here as regime characterisation, not a P&L forecast.
+// ============================================================================
+
+_SECTION_BEGIN("Markov 2.0 — Mode");
+ModeParam     = ParamList("Mode", "FILTER|STANDALONE", 0);
+//   0 = FILTER     — gate your existing strategy with the Markov signal
+//   1 = STANDALONE — trade the signal directly, size by |signal|
+_SECTION_END();
+
+_SECTION_BEGIN("Markov 2.0 — Regime Parameters");
+Window        = Param("Window / Stride (bars)",   20,  5, 100, 5);
+BullThreshPct = Param("Bull Threshold (%)",         5,  1,  20, 0.5);
+BearThreshPct = Param("Bear Threshold (%)",         5,  1,  20, 0.5);
+_SECTION_END();
+
+_SECTION_BEGIN("Markov 2.0 — Signal Parameters");
+SignalThreshPct = Param("Signal Threshold (%)",   10,  0,  50, 1);
+EnableShort     = ParamToggle("Enable Short Trades", "No|Yes", 0);
+MaxPosSizePct   = Param("Max Position Size % (STANDALONE)", 100, 10, 200, 10);
+_SECTION_END();
+
+SetBarsRequired(Window * 20, 0);
+
+// ============================================================================
+// DAILY COMPRESSION
+// ============================================================================
+TimeFrameSet(inDaily);
+dClose = Close;
+TimeFrameRestore();
+C_d = TimeFrameExpand(dClose, inDaily, expandLast);
+
+// ============================================================================
+// REGIME LABELS — State: 0 = BEAR | 1 = SIDEWAYS | 2 = BULL
+// ============================================================================
+BullThresh =  BullThreshPct / 100;
+BearThresh = -BearThreshPct / 100;
+
+CumRet = (C_d - Ref(C_d, -Window)) / Ref(C_d, -Window);
+State  = IIf(CumRet >= BullThresh, 2,
+         IIf(CumRet <= BearThresh, 0,
+             1));
+
+// ============================================================================
+// TRANSITION MATRIX — stride-sampled only (FIX 1)
+// ============================================================================
+st00=0; st01=0; st02=0;
+st10=0; st11=0; st12=0;
+st20=0; st21=0; st22=0;
+
+for (i = Window; i < BarCount; i++)
+{
+    if ((i % Window) == 0)
+    {
+        fs = State[i - Window];
+        ts = State[i];
+        if (fs==0) { if (ts==0) st00++; else if (ts==1) st01++; else st02++; }
+        else if (fs==1) { if (ts==0) st10++; else if (ts==1) st11++; else st12++; }
+        else             { if (ts==0) st20++; else if (ts==1) st21++; else st22++; }
+    }
+}
+
+r0s = Max(st00+st01+st02, 1);
+r1s = Max(st10+st11+st12, 1);
+r2s = Max(st20+st21+st22, 1);
+P00s=st00/r0s; P01s=st01/r0s; P02s=st02/r0s;
+P10s=st10/r1s; P11s=st11/r1s; P12s=st12/r1s;
+P20s=st20/r2s; P21s=st21/r2s; P22s=st22/r2s;
+
+// ============================================================================
+// SIGNAL — per bar
+// Signal = P(next=BULL | current) − P(next=BEAR | current)
+// ============================================================================
+Signal = IIf(State==0, P02s - P00s,
+         IIf(State==1, P12s - P10s,
+                       P22s - P20s));
+
+SignalThresh =  SignalThreshPct / 100;
+BullGate     = Signal >  SignalThresh;
+BearGate     = Signal < -SignalThresh;
+
+// ============================================================================
+// FIX 2 — LABEL VERIFICATION (Output window)
+// ============================================================================
+if (Status("firstbarinrange"))
+{
+    _TRACE("========================================================");
+    _TRACE("Markov 2.0 Signal | " + Name() + " | Mode=" +
+           IIf(ModeParam==0, "FILTER", "STANDALONE"));
+    _TRACE(StrFormat("Window=%d  BullThresh=+%.1f%%  BearThresh=-%.1f%%  SignalThresh=%.1f%%",
+                     Window, BullThreshPct, BearThreshPct, SignalThreshPct));
+    _TRACE("Label verification (first 5 stride periods):");
+    for (k = 0; k < 5; k++)
+    {
+        b = k * Window + Window - 1;
+        if (b < BarCount)
+        {
+            rv = CumRet[b] * 100;
+            sv = State[b];
+            _TRACE(StrFormat("  Period %d (bar %d): Return=%+.2f%% -> %s",
+                   k+1, b, rv,
+                   IIf(sv==2, "BULL", IIf(sv==0, "BEAR", "SIDEWAYS"))));
+        }
+    }
+    _TRACE(StrFormat("Stride matrix diagonal: BEAR→BEAR=%.1f%%  SIDE→SIDE=%.1f%%  BULL→BULL=%.1f%%",
+                     P00s*100, P11s*100, P22s*100));
+    _TRACE("WARNING: Full-history matrix has lookahead bias. See header note.");
+    _TRACE("========================================================");
+}
+
+// ============================================================================
+// FIX 3 — MODE: FILTER or STANDALONE
+// ============================================================================
+if (ModeParam == 0)  // ── FILTER MODE ────────────────────────────────────────
+{
+    // ┌─────────────────────────────────────────────────────────────────────┐
+    // │  INSERT YOUR STRATEGY SIGNALS HERE                                  │
+    // │  Replace MyBuy / MySell / MyShort / MyCover with your own arrays.  │
+    // │  The Markov gate (BullGate / BearGate) will filter them below.     │
+    // └─────────────────────────────────────────────────────────────────────┘
+    MyBuy   = Cross(MA(C_d, 10), MA(C_d, 50));  // ← replace with your signal
+    MySell  = Cross(MA(C_d, 50), MA(C_d, 10));  // ← replace with your signal
+    MyShort = Cross(MA(C_d, 50), MA(C_d, 10));  // ← replace with your signal
+    MyCover = Cross(MA(C_d, 10), MA(C_d, 50));  // ← replace with your signal
+    // ──────────────────────────────────────────────────────────────────────
+
+    Buy   = MyBuy  AND BullGate;
+    Sell  = MySell;
+    Short = MyShort AND BearGate AND EnableShort;
+    Cover = MyCover AND EnableShort;
+}
+else  // ── STANDALONE MODE ────────────────────────────────────────────────────
+{
+    // Enter on first bar that crosses into bull/bear gate zone; exit when
+    // signal drops back below threshold.
+    Buy   = BullGate AND NOT Ref(BullGate, -1);
+    Sell  = NOT BullGate;
+    Short = BearGate AND NOT Ref(BearGate, -1) AND EnableShort;
+    Cover = NOT BearGate AND EnableShort;
+
+    // Size scales to signal conviction, capped at MaxPosSizePct.
+    // Negative value = percent of equity (Amibroker convention).
+    PositionSize = -Min(Abs(Signal) * MaxPosSizePct * 100, MaxPosSizePct);
+}
+
+Buy   = ExRem(Buy,   Sell);
+Short = ExRem(Short, Cover);
+
+// ============================================================================
+// CHART OVERLAYS — visible when formula is applied to a chart
+// ============================================================================
+Plot(C_d, "Price", colorDefault, styleCandle | styleNoTitle);
+
+// Regime ribbon (subtle background band, own scale in panel below)
+RegClr = IIf(State==2, ColorRGB(80,180,120),
+         IIf(State==0, ColorRGB(200,80,80),
+                       ColorRGB(140,140,160)));
+
+// Signal histogram in a separate panel
+Plot(Signal * 100, "Markov Signal%", RegClr,
+     styleHistogram | styleOwnScale | styleNoTitle, -100, 100, 0, -2);
+
+// Zero line + threshold lines
+Plot(SignalThreshPct,  "BullThresh", ColorRGB(80,180,120),
+     styleLine | styleNoTitle | styleOwnScale, -100, 100, 0, -2);
+Plot(-SignalThreshPct, "BearThresh", ColorRGB(200,80,80),
+     styleLine | styleNoTitle | styleOwnScale, -100, 100, 0, -2);
+
+Title = "{{NAME}} | Markov 2.0 "
+      + IIf(ModeParam==0, "FILTER", "STANDALONE")
+      + " | State=" + IIf(LastValue(State)==2,"BULL",IIf(LastValue(State)==0,"BEAR","SIDE"))
+      + StrFormat(" | Signal=%.1f%%", LastValue(Signal)*100)
+      + StrFormat(" | Gate: Bull=%s  Bear=%s",
+                  IIf(LastValue(BullGate), "OPEN", "CLOSED"),
+                  IIf(LastValue(BearGate), "OPEN", "CLOSED"));

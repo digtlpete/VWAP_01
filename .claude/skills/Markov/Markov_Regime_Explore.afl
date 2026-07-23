@@ -1,0 +1,238 @@
+// ============================================================================
+// Markov_Regime_Explore.afl
+// Markov 2.0 — Hedge Fund Regime Method — AmiBroker Exploration Formula
+// ============================================================================
+// Scans your Amibroker database and displays, per symbol:
+//   - Current regime state (BULL / SIDEWAYS / BEAR)
+//   - Regime-differential signal (P[→BULL] − P[→BEAR])
+//   - Full 3×3 transition matrix — overlapping AND stride-sampled side by side
+//   - Stationary distribution (long-run regime mix)
+//
+// THREE FIXES FROM MARKOV 2.0:
+//
+//   FIX 1 — STRIDE SAMPLING (autocorrelation fix)
+//     Overlapping 20-day windows share 19 bars → fakes persistence on the
+//     diagonal. Both matrices are shown. ONLY the stride-sampled matrix
+//     (column prefix "Stride") is statistically honest. The overlapping
+//     matrix (prefix "Ovlap") is shown as legacy comparison and will always
+//     show inflated diagonal values. Never trade from the overlapping matrix.
+//
+//   FIX 2 — LABEL VERIFICATION
+//     At exploration time, the first 5 stride periods are printed to the
+//     Amibroker Output window with their raw return and assigned state.
+//     Verify that known bull/bear periods in your data map correctly before
+//     reading any matrix values.
+//
+//   FIX 3 — MODE DECLARATION
+//     This formula is ANALYSIS / EXPLORATION mode only. It has no Buy/Sell
+//     signals. For FILTER mode (Markov gates your strategy) or STANDALONE
+//     mode (trade the signal directly), load Markov_Regime_Signal.afl.
+//
+// HOW TO RUN:
+//   1. Analysis → New Analysis → Formula: load this file
+//   2. Apply To: your watchlist or a Market scan
+//   3. Range: 5+ years of daily history is recommended
+//   4. Interval: Daily (or any — formula compresses via TimeFrameSet if needed)
+//   5. Click Explore → sort by "Signal" column to rank by regime conviction
+//   6. Check the Output window (View → Output Window) for the matrix printout
+//      and label verification (FIX 2)
+// ============================================================================
+
+_SECTION_BEGIN("Markov 2.0 — Parameters");
+Window        = Param("Window / Stride (bars)",   20,  5, 100, 5);
+BullThreshPct = Param("Bull Threshold (%)",         5,  1,  20, 0.5);
+BearThreshPct = Param("Bear Threshold (%)",         5,  1,  20, 0.5);
+MinBars       = Param("Min Bars Required",        252, 50, 2000, 50);
+_SECTION_END();
+
+SetOption("NoDefaultColumns", True);
+SetBarsRequired(Max(Window * 20, MinBars), 0);
+
+// ============================================================================
+// DAILY COMPRESSION — safe to run on any chart interval
+// ============================================================================
+TimeFrameSet(inDaily);
+dClose = Close;
+TimeFrameRestore();
+C_d = TimeFrameExpand(dClose, inDaily, expandLast);
+
+// ============================================================================
+// REGIME LABELS
+// State: 0 = BEAR | 1 = SIDEWAYS | 2 = BULL
+// Window-bar cumulative return vs symmetric thresholds
+// ============================================================================
+BullThresh =  BullThreshPct / 100;
+BearThresh = -BearThreshPct / 100;
+
+CumRet = (C_d - Ref(C_d, -Window)) / Ref(C_d, -Window);
+State  = IIf(CumRet >= BullThresh, 2,
+         IIf(CumRet <= BearThresh, 0,
+             1));
+
+// ============================================================================
+// TRANSITION MATRIX COUNTS
+//
+// Overlapping  : every consecutive bar pair → biased (FIX 1 warning)
+// Stride-sampled: State[i - Window] → State[i] for i = Window, 2W, 3W, ...
+//                 Non-overlapping windows; statistically honest (FIX 1)
+// ============================================================================
+ov00=0; ov01=0; ov02=0;
+ov10=0; ov11=0; ov12=0;
+ov20=0; ov21=0; ov22=0;
+
+st00=0; st01=0; st02=0;
+st10=0; st11=0; st12=0;
+st20=0; st21=0; st22=0;
+
+for (i = Window; i < BarCount; i++)
+{
+    // Overlapping: every consecutive pair
+    fn = State[i-1];
+    tn = State[i];
+    if (fn==0) { if (tn==0) ov00++; else if (tn==1) ov01++; else ov02++; }
+    else if (fn==1) { if (tn==0) ov10++; else if (tn==1) ov11++; else ov12++; }
+    else             { if (tn==0) ov20++; else if (tn==1) ov21++; else ov22++; }
+
+    // Stride-sampled: only at i = Window, 2W, 3W, ...
+    if ((i % Window) == 0)
+    {
+        fs = State[i - Window];
+        ts = State[i];
+        if (fs==0) { if (ts==0) st00++; else if (ts==1) st01++; else st02++; }
+        else if (fs==1) { if (ts==0) st10++; else if (ts==1) st11++; else st12++; }
+        else             { if (ts==0) st20++; else if (ts==1) st21++; else st22++; }
+    }
+}
+
+// ============================================================================
+// ROW-NORMALISE → probability matrices
+// ============================================================================
+// Overlapping
+r0o = Max(ov00+ov01+ov02, 1);
+r1o = Max(ov10+ov11+ov12, 1);
+r2o = Max(ov20+ov21+ov22, 1);
+P00o=ov00/r0o; P01o=ov01/r0o; P02o=ov02/r0o;
+P10o=ov10/r1o; P11o=ov11/r1o; P12o=ov12/r1o;
+P20o=ov20/r2o; P21o=ov21/r2o; P22o=ov22/r2o;
+
+// Stride
+r0s = Max(st00+st01+st02, 1);
+r1s = Max(st10+st11+st12, 1);
+r2s = Max(st20+st21+st22, 1);
+P00s=st00/r0s; P01s=st01/r0s; P02s=st02/r0s;
+P10s=st10/r1s; P11s=st11/r1s; P12s=st12/r1s;
+P20s=st20/r2s; P21s=st21/r2s; P22s=st22/r2s;
+
+// ============================================================================
+// STATIONARY DISTRIBUTION — stride matrix only
+// π satisfies: π = π · P  (left eigenvector, eigenvalue = 1)
+// Computed via power iteration: repeatedly apply π ← π · P (50 steps)
+// ============================================================================
+pi0 = 1/3; pi1 = 1/3; pi2 = 1/3;
+for (k = 0; k < 50; k++)
+{
+    np0 = pi0*P00s + pi1*P10s + pi2*P20s;
+    np1 = pi0*P01s + pi1*P11s + pi2*P21s;
+    np2 = pi0*P02s + pi1*P12s + pi2*P22s;
+    pi0=np0; pi1=np1; pi2=np2;
+}
+
+// ============================================================================
+// SIGNAL — per-bar array, using stride-sampled matrix
+// Signal = P(next=BULL | current) − P(next=BEAR | current)
+// Positive → bullish conviction | Negative → bearish conviction
+// Magnitude = strength of regime tendency
+// ============================================================================
+Signal = IIf(State==0, P02s - P00s,   // from BEAR
+         IIf(State==1, P12s - P10s,   // from SIDEWAYS
+                       P22s - P20s)); // from BULL
+
+CurState  = LastValue(State);
+CurSignal = LastValue(Signal);
+
+// ============================================================================
+// FIX 2 — LABEL VERIFICATION (Output window)
+// Prints the first 5 stride periods with raw return + assigned state label.
+// Open View → Output Window in Amibroker to review.
+// If any period is obviously mis-labelled, adjust Bull/Bear Threshold params.
+// ============================================================================
+if (Status("action") == actionExplore)
+{
+    _TRACE("========================================================");
+    _TRACE("Markov 2.0 Label Verification: " + Name());
+    _TRACE(StrFormat("Window=%d  BullThresh=+%.1f%%  BearThresh=-%.1f%%",
+                     Window, BullThreshPct, BearThreshPct));
+    _TRACE("First 5 stride periods (verify BULL/BEAR/SIDEWAYS mapping):");
+    for (k = 0; k < 5; k++)
+    {
+        b = k * Window + Window - 1;
+        if (b < BarCount)
+        {
+            rv  = CumRet[b] * 100;
+            sv  = State[b];
+            _TRACE(StrFormat("  Period %d (bar %d): Return=%+.2f%% -> %s",
+                   k+1, b, rv,
+                   IIf(sv==2, "BULL", IIf(sv==0, "BEAR", "SIDEWAYS"))));
+        }
+    }
+
+    _TRACE("");
+    _TRACE("--- STRIDE MATRIX (Fix 1 — statistically honest) ---");
+    _TRACE(StrFormat("           ->BEAR   ->SIDE   ->BULL  | N obs"));
+    _TRACE(StrFormat("  BEAR:  %6.1f%%  %6.1f%%  %6.1f%%  | %d", P00s*100, P01s*100, P02s*100, r0s));
+    _TRACE(StrFormat("  SIDE:  %6.1f%%  %6.1f%%  %6.1f%%  | %d", P10s*100, P11s*100, P12s*100, r1s));
+    _TRACE(StrFormat("  BULL:  %6.1f%%  %6.1f%%  %6.1f%%  | %d", P20s*100, P21s*100, P22s*100, r2s));
+    _TRACE(StrFormat("Stationary: BEAR=%.1f%%  SIDE=%.1f%%  BULL=%.1f%%",
+                     pi0*100, pi1*100, pi2*100));
+
+    _TRACE("");
+    _TRACE("--- OVERLAPPING MATRIX (legacy — diagonal inflated by autocorrelation) ---");
+    _TRACE(StrFormat("           ->BEAR   ->SIDE   ->BULL"));
+    _TRACE(StrFormat("  BEAR:  %6.1f%%  %6.1f%%  %6.1f%%", P00o*100, P01o*100, P02o*100));
+    _TRACE(StrFormat("  SIDE:  %6.1f%%  %6.1f%%  %6.1f%%", P10o*100, P11o*100, P12o*100));
+    _TRACE(StrFormat("  BULL:  %6.1f%%  %6.1f%%  %6.1f%%", P20o*100, P21o*100, P22o*100));
+    _TRACE("WARNING: Only the STRIDE matrix is statistically valid for trading.");
+    _TRACE("========================================================");
+}
+
+// ============================================================================
+// EXPLORATION COLUMNS
+// Sort by Signal descending to surface highest-conviction bullish regime symbols
+// ============================================================================
+Filter = Status("action") == actionExplore
+     AND Status("lastbarinrange")
+     AND BarCount >= MinBars;
+
+AddTextColumn(Name(), "Symbol");
+AddTextColumn(IIf(CurState==2, "BULL", IIf(CurState==0, "BEAR", "SIDE")), "State");
+AddColumn(CurSignal * 100, "Signal%",  1.2);
+
+// Stride matrix — diagonal (persistence = the "load-bearing reveal")
+AddColumn(P00s * 100, "Stride B→B%",  1.1);
+AddColumn(P11s * 100, "Stride S→S%",  1.1);
+AddColumn(P22s * 100, "Stride U→U%",  1.1);
+
+// Stride matrix — P(→BULL) from each state
+AddColumn(P02s * 100, "B→Bull%",  1.1);
+AddColumn(P12s * 100, "S→Bull%",  1.1);
+AddColumn(P22s * 100, "U→Bull%",  1.1);
+
+// Stationary distribution
+AddColumn(pi0 * 100, "π BEAR%", 1.1);
+AddColumn(pi1 * 100, "π SIDE%", 1.1);
+AddColumn(pi2 * 100, "π BULL%", 1.1);
+
+// Overlapping diagonal (comparison only — will be inflated)
+AddColumn(P00o * 100, "Ovlap B→B%", 1.1);
+AddColumn(P11o * 100, "Ovlap S→S%", 1.1);
+AddColumn(P22o * 100, "Ovlap U→U%", 1.1);
+
+AddColumn(r0s + r1s + r2s, "Stride N",  1.0);
+AddColumn(BarCount,         "Total Bars", 1.0);
+
+SetSortColumns(-3);  // Sort by Signal% descending
+
+Title = "{{NAME}} | Markov 2.0 Analysis"
+      + " | State=" + IIf(CurState==2,"BULL",IIf(CurState==0,"BEAR","SIDE"))
+      + StrFormat(" | Signal=%.2f%%", CurSignal*100)
+      + StrFormat(" | π BULL=%.1f%%  π BEAR=%.1f%%", pi2*100, pi0*100);
